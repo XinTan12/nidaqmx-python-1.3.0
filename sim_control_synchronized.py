@@ -5,8 +5,9 @@ SIM 硬件同步控制（中文注释版，UTF-8）
 核心方案：
 - 单个硬件定时 DO 任务（按端口位掩码写入）+ retriggerable 单帧重放；
 - 计数器使用隐式时钟（cfg_implicit_timing + FINITE），“事件=采样”，计满 N 次自动完成；
-- 每个 loop 开始时记录时间戳，loop 结束后根据 loop_start_spacing_ms（两个 loop 开始之间的目标间隔，毫秒）
-  计算剩余时间，在剩余时间内仅拉低 Enable，保证下一个 loop 准时开始。
+- 每张 SIM 图片开始时记录时间戳，图片采集完成后根据 loop_start_spacing_ms（图片拍摄周期：两张 SIM 图片开始之间的目标间隔，毫秒）
+  计算剩余时间；在剩余时间内仅拉低 Enable，保证下一张图片准时开始。
+
 """
 
 import time
@@ -16,7 +17,7 @@ from typing import Optional, List
 
 import numpy as np
 import nidaqmx
-from nidaqmx.constants import AcquisitionType, LineGrouping, Edge, CountDirection
+from nidaqmx.constants import AcquisitionType, LineGrouping, Edge, CountDirection, RegenerationMode
 from nidaqmx.stream_writers import DigitalSingleChannelWriter
 
 
@@ -48,6 +49,13 @@ class SIMController:
     DEFAULT_TRIGGER_SOURCE = "/Dev1/PFI8"  # 相机 Ready 触发源（PFI 终端路径）
     DEFAULT_COUNTER_CHANNEL = "ctr0"       # 计数器通道名称（Dev1/ctr0）
 
+    DEFAULT_EXPOSURE_US = 100_000          # 单帧曝光（微秒）
+    DEFAULT_FRAMES_PER_IMAGE = 9           # 单张图片包含的帧数
+    DEFAULT_NUM_IMAGES = 1                 # 图片张数
+    PULSE_EDGE_US = 100                    # SLM trigger/finish 脉冲宽度（微秒）
+    PRE_ENABLE_MS = 1.0                    # 图片开始前：SLM Enable 预置高电平时长（毫秒）
+    TAIL_LOW_MS = 1.0                      # 图片结束后：“全低尾段”时长（毫秒）
+
     def __init__(
         self,
         device_name: str = "Dev1",
@@ -62,6 +70,10 @@ class SIMController:
         self.frames_per_loop = frames_per_loop
         self.num_loops = num_loops
         self.sample_rate = sample_rate
+        # 容错：若外部传入 None 或非法采样率，回退到默认值
+        if self.sample_rate is None or (isinstance(self.sample_rate, (int, float)) and self.sample_rate <= 0):
+            logger.warning("采样率无效，使用默认值 %s Hz", self.DEFAULT_SAMPLE_RATE)
+            self.sample_rate = self.DEFAULT_SAMPLE_RATE
 
         # 处理激光器选择（默认仅 488nm）
         if active_lasers is None:
@@ -81,17 +93,23 @@ class SIMController:
         }
 
         # 曝光对应的采样点数（由采样率换算）
-        self.exposure_samples = int(exposure_time_us / (1e6 / sample_rate))
+        self.exposure_samples = int(exposure_time_us / (1e6 / self.sample_rate))
 
         # 任务句柄
         self.do_task: Optional[nidaqmx.Task] = None
         self.counter_task: Optional[nidaqmx.Task] = None
+        # 输出缓存与写入器（优化：重复触发复用缓冲，避免重复构造）
+        self._frame_packed: Optional[np.ndarray] = None
+        self._frame_samples: Optional[int] = None
+        self._writer: Optional[DigitalSingleChannelWriter] = None
+        # 尾段“全低”样本数
+        self._tail_samples: int = max(1, int((self.TAIL_LOW_MS / 1000.0) * self.sample_rate))
 
         logger.info("SIM 控制器已初始化")
         logger.info(f"  设备: {device_name}")
         logger.info(f"  曝光时间: {exposure_time_us} 微秒")
-        logger.info(f"  每循环帧数: {frames_per_loop}")
-        logger.info(f"  循环次数: {num_loops}")
+        logger.info(f"  每张图片帧数: {frames_per_loop}")
+        logger.info(f"  图片张数: {num_loops}")
         logger.info(f"  采样率: {sample_rate} Hz")
 
     def setup_tasks(self) -> None:
@@ -115,6 +133,25 @@ class SIMController:
             samps_per_chan=10_000,
         )
 
+        # 明确允许再生（缓冲复用），以支持 retriggerable 重放同一帧数据
+        try:
+            self.do_task.out_stream.regen_mode = RegenerationMode.ALLOW_REGENERATION
+        except Exception:
+            pass
+
+        # 预构建单帧缓冲与写入器（避免每张图片重复构建）
+        try:
+            frame_wf = self.generate_frame_waveform()
+            self._frame_samples = frame_wf.shape[1]
+            self._frame_packed = self._pack_waveform_to_port_uint16(frame_wf)
+        except Exception:
+            # 若失败则延迟到 execute_single_loop 时再构建
+            self._frame_packed = None
+            self._frame_samples = None
+
+        if self._writer is None:
+            self._writer = DigitalSingleChannelWriter(self.do_task.out_stream)
+
     def generate_frame_waveform(self) -> np.ndarray:
         """
         生成单帧 0/1 波形矩阵（形状：8 x samples）。
@@ -122,11 +159,11 @@ class SIMController:
         规则：
         - 相机触发/激光：在曝光期间为高；
         - SLM enable：整帧为高；
-        - SLM trigger：帧开始 100 微秒；
-        - SLM finish：曝光结束后 100 微秒。
+        - SLM trigger：帧开始脉冲宽度由 PULSE_EDGE_US 控制（默认 100 us）；
+        - SLM finish：曝光结束后脉冲宽度由 PULSE_EDGE_US 控制（默认 100 us）。
         """
         trigger_high_samples = self.exposure_samples
-        trigger_edge_samples = max(1, int(100 / (1e6 / self.sample_rate)))  # 100 us 脉冲
+        trigger_edge_samples = max(1, int((self.PULSE_EDGE_US / 1e6) * self.sample_rate))  # SLM 边沿脉冲
         total_samples = trigger_high_samples + trigger_edge_samples
 
         w = np.zeros((8, total_samples), dtype=np.uint8)
@@ -181,12 +218,13 @@ class SIMController:
                 w[self.SLM_ENABLE_LINE, :] = 1
 
             self.do_task.timing.samp_quant_samp_per_chan = duration_samples
-            writer = DigitalSingleChannelWriter(self.do_task.out_stream)
+            if self._writer is None:
+                self._writer = DigitalSingleChannelWriter(self.do_task.out_stream)
             packed = self._pack_waveform_to_port_uint16(w)
-            writer.write_many_sample_port_uint16(packed)
+            self._writer.write_many_sample_port_uint16(packed)
 
             self.do_task.start()
-            self.do_task.wait_until_done(timeout=max(1.0, duration_ms / 1000.0 + 0.5))
+            self.do_task.wait_until_done(timeout=(duration_ms/1000.0) * 1.2)
             self.do_task.stop()
             return True
         except Exception as e:
@@ -199,10 +237,10 @@ class SIMController:
         counter_channel: str = None,
     ) -> bool:
         """
-        执行一个 loop（N 帧）：
+        执行一张图片（N 帧）：
         - Counter：边沿计数 + 隐式时钟 + 有限采样（N 次事件自动完成）；
         - DO：写入“单帧”缓冲，配置数字开始触发为相机 Ready，并允许 retriggerable；
-        - 结束：等待第 N 帧完整输出再停止任务，避免最后一帧被截断。
+        - 结束：等待第 N 帧完整输出，再追加“尾段拉低”，保证图片间端口保持低电平。
         """
         if digital_trigger_source is None:
             digital_trigger_source = self.DEFAULT_TRIGGER_SOURCE
@@ -222,24 +260,29 @@ class SIMController:
                 samps_per_chan=self.frames_per_loop,
             )
 
-            # loop 前：SLM Enable 预置为高（系统默认 1 ms）
-            if not self.set_slm_enable(True):
-                logger.error("loop 前 SLM Enable 预置失败")
+            # 图片开始前：SLM Enable 预置为高（使用类常量 PRE_ENABLE_MS）
+            if not self.set_slm_enable(True, duration_ms=self.PRE_ENABLE_MS):
+                logger.error("图片开始前 SLM Enable 预置失败")
                 self.counter_task.close(); self.counter_task = None
                 return False
 
             # DO：单帧缓冲 + retriggerable（每个 Ready 上升沿重放一帧）
-            frame_wf = self.generate_frame_waveform()
-            frame_samples = frame_wf.shape[1]
+            # 若尚未构建单帧缓冲（或外部参数变化导致 None），此处构建一次并缓存
+            if self._frame_packed is None or self._frame_samples is None:
+                frame_wf = self.generate_frame_waveform()
+                self._frame_samples = frame_wf.shape[1]
+                self._frame_packed = self._pack_waveform_to_port_uint16(frame_wf)
+
+            frame_samples = self._frame_samples
             self.do_task.timing.samp_quant_samp_per_chan = frame_samples
             self.do_task.triggers.start_trigger.cfg_dig_edge_start_trig(
                 trigger_source=digital_trigger_source, trigger_edge=Edge.RISING
             )
             self.do_task.triggers.start_trigger.retriggerable = True
 
-            writer = DigitalSingleChannelWriter(self.do_task.out_stream)
-            packed = self._pack_waveform_to_port_uint16(frame_wf)
-            writer.write_many_sample_port_uint16(packed)
+            if self._writer is None:
+                self._writer = DigitalSingleChannelWriter(self.do_task.out_stream)
+            self._writer.write_many_sample_port_uint16(self._frame_packed)
 
             # 启动任务
             self.counter_task.start()
@@ -262,9 +305,8 @@ class SIMController:
             except Exception:
                 used_callback = False
 
-            waveform_time_s = frame_samples / self.sample_rate
-            frame_expected_time = waveform_time_s + 0.012
-            loop_timeout = self.frames_per_loop * frame_expected_time * 1.2  # 安全系数 1.2×
+            frame_expected_time = (frame_samples / self.sample_rate)
+            loop_timeout = self.frames_per_loop * frame_expected_time * 2.0  # 安全系数 2×
 
             if used_callback:
                 logger.info("计时器等待策略：完成事件回调（Done event）+ 线程事件等待")
@@ -274,47 +316,53 @@ class SIMController:
                 logger.info("计时器等待策略：阻塞等待（wait_until_done）")
                 self.counter_task.wait_until_done(timeout=loop_timeout)
 
+            # 计数器任务已达到 N 次事件并进入 Done，可在此提前停止并关闭以释放路由/资源
+            try:
+                if self.counter_task:
+                    self.counter_task.stop()
+                    self.counter_task.close()
+                    self.counter_task = None
+            except Exception:
+                pass
+
             # 确保最后一帧完整输出（按 1.2× 单帧时长等待）
             try:
                 self.do_task.wait_until_done(timeout=frame_expected_time * 1.2)
             except Exception:
                 pass
+            # 等待最后一帧完成后，先暂停 DO 任务，再配置尾段
+            try:
+                self.do_task.stop()
+            except Exception:
+                pass
 
             # 追加“全低尾段”（例如 1 ms），使端口在停止后保持低电平
             try:
-                # 先确保当前运行段已停止，再配置并播放尾段
-                try:
-                    self.do_task.stop()
-                except Exception:
-                    pass
-
                 # 禁用开始触发，立即播放
                 try:
                     self.do_task.triggers.start_trigger.disable_start_trig()
                 except Exception:
                     pass
 
-                tail_ms = 1.0
-                tail_samples = max(1, int((tail_ms * 1e-3) * self.sample_rate))
+                tail_samples = self._tail_samples
                 self.do_task.timing.samp_quant_samp_per_chan = tail_samples
-                writer = DigitalSingleChannelWriter(self.do_task.out_stream)
+                if self._writer is None:
+                    self._writer = DigitalSingleChannelWriter(self.do_task.out_stream)
                 zero_masks = np.zeros(tail_samples, dtype=np.uint16)
-                writer.write_many_sample_port_uint16(zero_masks)
+                self._writer.write_many_sample_port_uint16(zero_masks)
 
                 self.do_task.start()
-                self.do_task.wait_until_done(timeout=max(0.5, tail_ms/1000.0 + 0.1))
+                self.do_task.wait_until_done(timeout=(tail_samples/self.sample_rate) * 1.2)
+                # 停止后端口保持低电平
                 self.do_task.stop()
             except Exception:
                 pass
 
-            # 停止任务
-            self.do_task.stop()
-            self.counter_task.stop()
+            # DO 已在尾段后停止（Counter 已在前面释放）
 
-            self.counter_task.close(); self.counter_task = None
             return True
         except Exception as e:
-            logger.error(f"执行单个 loop 失败: {e}")
+            logger.error(f"执行单张图片失败: {e}")
             try:
                 if self.counter_task:
                     self.counter_task.stop(); self.counter_task.close()
@@ -323,13 +371,6 @@ class SIMController:
             self.counter_task = None
             return False
 
-    def execute_interval(self, interval_time_ms: float = 10.0) -> bool:
-        """
-        loop 之间的“间隔段”：仅将 SLM Enable 置为低电平、保持指定时长。
-        说明：单帧波形结束时，除 Enable 外，其余线均为 0，因此间隔阶段只需拉低 Enable。
-        """
-        return self.set_slm_enable(False, interval_time_ms)
-
     def run_acquisition(
         self,
         digital_trigger_source: str = None,
@@ -337,9 +378,9 @@ class SIMController:
         loop_start_spacing_ms: float = 2000.0,
     ) -> bool:
         """
-        执行多次 loop，并使用“两个 loop 开始之间的目标间隔”（毫秒）来安排间隔：
-        - 每个 loop 开始时记录时间戳；
-        - loop 完成后按目标间隔计算剩余时间，仅在剩余时间内拉低 Enable，保证下一个 loop 准时开始。
+        执行多张图片，并使用“图片拍摄周期（两张图片开始之间的目标间隔，毫秒）”来安排间隔：
+        - 每张图片开始时记录时间戳；
+        - 图片采集完成后按目标间隔计算剩余时间，仅在剩余时间内拉低 Enable，保证下一张图片准时开始。
         说明：
         - digital_trigger_source: 相机 Ready 触发源（PFI 终端路径）；
         - counter_channel: 计数器通道名称（如 "ctr0"）。
@@ -355,7 +396,7 @@ class SIMController:
             self.setup_tasks()
             for i in range(self.num_loops):
                 logger.info(f"=== 正在采集第 {i+1}/{self.num_loops} 张图片 ===")
-                loop_start_ts = time.time()
+                loop_start_ts = time.perf_counter()
 
                 if not self.execute_single_loop(
                     digital_trigger_source=digital_trigger_source,
@@ -367,9 +408,9 @@ class SIMController:
                 logger.info(f"第 {i+1} 张图片采集完成")
 
                 if i < self.num_loops - 1:
-                    interval_ts = loop_start_ts + loop_start_spacing_ms / 1000.0
-                    now = time.time()
-                    remain_ms = max(0.0, (interval_ts - now) * 1000.0)
+                    next_start_ts = loop_start_ts + loop_start_spacing_ms / 1000.0
+                    now = time.perf_counter()
+                    remain_ms = max(0.0, (next_start_ts - now) * 1000.0)
                     if remain_ms <= 0:
                         logger.warning("本次图片采集用时超过设定的开始间隔，跳过间隔阶段")
                     else:
@@ -407,21 +448,21 @@ def main() -> int:
     print("方案要点：")
     print("  • 单个 DO 任务（端口位掩码写）+ retriggerable 单帧重放")
     print("  • 计数器隐式时钟（FINITE）：事件=采样，N 次自动完成")
-    print("  • 支持设定“两个 loop 开始之间”的时间间隔（loop_start_spacing_ms）")
+    print("  • 支持设定“图片拍摄周期”（两张SIM图片开始之间的间隔，loop_start_spacing_ms）")
     print()
     print("接线概要：")
     print("  • DO: Dev1/port0/line0..7 → 相机触发、激光 TTL、SLM 三线")
-    print("  • Ready 触发: /Dev1/PFI8（可在参数中改为其它 PFI）")
+    print("  • 相机 Ready 输出: /Dev1/PFI8（可在参数中改为其它 PFI）")
     print("  • 计数器: Dev1/ctr0（PFI8 路由到计数器输入）")
     print()
     print("使用示例（可按需修改）：")
     print("  device_name='Dev1'")
-    print("  exposure_time_us=100000   # 100 ms 曝光 ≈ 在 100 kHz 下 10000 点")
-    print("  frames_per_loop=9         # 单个 loop 的帧数")
-    print("  num_loops=1               # loop 次数")
-    print("  sample_rate=100000        # 100 kHz（10 微秒/点）")
-    print("  active_lasers=None        # None=默认仅 488 nm；或 [405,488,561,647]")
-    print("  loop_start_spacing_ms=2000.0  # 两个 loop 开始之间的目标间隔（毫秒）")
+    print("  exposure_time_us=100000   # 相机曝光时间 100 ms")
+    print("  frames_per_loop=9         # 单张 SIM 图片包含的帧数")
+    print("  num_loops=1               # SIM 图片张数（loop 次数）")
+    print("  sample_rate=100000        # 硬件时钟采样率 100 kHz（10 微秒/点）")
+    print("  active_lasers=None        # None=默认仅 488 nm；或 可选[405,488,561,647]")
+    print("  loop_start_spacing_ms=2000.0  # 图片拍摄周期（两张 SIM 图片开始之间的间隔，毫秒）")
 
     cfg = dict(
         device_name='Dev1',
@@ -448,5 +489,6 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
 
 
