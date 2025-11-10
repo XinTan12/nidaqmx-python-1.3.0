@@ -1,0 +1,173 @@
+                               f"有效? {valid_lasers}")
+                        logger.info(f"  触发 {count}/{self.frames_per_loop} 检测到 (耗时: {elapsed:.3f}?")
+                    # NI-DAQmx: 读取计数器当前累计计?                    count = self.counter_task.read()
+                    # 如果计数增加，记?                    if count > last_count:
+                    logger.debug(f"  等待触发... 当前: {count}/{self.frames_per_loop}，已用时: {elapsed:.2f}?)
+                   f"{setup_samples}(setup) + {frame_samples * self.frames_per_loop}(9?")
+                # 定期输出状态（根据单帧时间调整间隔?                if time.time() - last_log_time >= log_interval and count == last_count:
+                # 执行循环（使用Counter精确计数?                if not self.execute_single_loop(
+                [405] - 仅激?05nm
+                [488, 561] - 激?88nm?61nm
+                edge=Edge.RISING,        # 计数上升?                initial_count=0,         # 初始计数值为0
+                logger.info(f"  Counter最终计? {final_count}")
+                logger.info(f"循环 {loop_num + 1} 完成（精?次触发）")
+                samps_per_chan=self.frames_per_loop  # 计数?次后自动停止
+                time.sleep(0.001)  # 1ms检查间?
+            # (NI-DAQmx) 端口写入 API 期望 1D uint16（端口位掩码，按位对?line0..lineN?
+            # - "隐式时钟"意味着：每次上升沿事件本身就是一?采样"
+            # - 硬件Counter在第9次上升沿到达后自动完成任?            # - 纳秒级精度，完全由硬件实现，无需Python轮询
+            # ? generated/nidaqmx/task/_timing.py:1286
+            # ? generated/nidaqmx/task/channels/_ci_channel.py:927
+            # NI-DAQmx: 停止任务（终止硬件生?计数?            self.do_task.stop()
+            # NI-DAQmx: 创建任务对象（后续添加通道/时序/触发/启动?            self.counter_task = nidaqmx.Task("CounterTask")
+            # NI-DAQmx: 添加“计数边沿”输入通道（上升沿计数?            ci_channel = self.counter_task.ci_channels.add_ci_count_edges_chan(
+            # NI-DAQmx: 端口级数字写入器（与 CHAN_FOR_ALL_LINES 搭配?            writer = DigitalSingleChannelWriter(self.do_task.out_stream)
+            # NI-DAQmx: 端口级数字写入器（单端口通道?            writer = DigitalSingleChannelWriter(self.do_task.out_stream)
+            # NI-DAQmx: 轮询任务是否完成（硬件侧?            while not self.counter_task.is_task_done():
+            # NI-DAQmx: 配置数字边沿开始触发（由相?ready 信号驱动?            self.do_task.triggers.start_trigger.cfg_dig_edge_start_trig(
+            # NI-DAQmx: 阻塞等待 DO 任务完成或超?            self.do_task.wait_until_done(timeout=10.0)
+            # NI-DAQmx: 隐式时钟 + 有限采样（事?采样，计满N次自动完成）
+            # SLM结束：曝光结束后?00us脉冲?            finish_start = cam_end
+            # SLM触发：帧开始时上升沿（100us脉冲?            waveform[self.SLM_TRIGGER_LINE, frame_start:frame_start + trigger_edge_samples] = 1
+            # 关键理解?            # - cfg_implicit_timing 中的"隐式时钟"是指：事件本身作为采样时?            # - 每次上升沿事?= 一?采样"
+            # 创建波形（仅SLM enable信号?            waveform = np.zeros((8, duration_samples), dtype=np.uint8)
+            # 原理?            # - Counter任务配置为cfg_implicit_timing + FINITE模式，samps_per_chan=9
+            # 参? generated/nidaqmx/stream_writers/_digital_single_channel_writer.py
+            # 步骤3: 准备DO任务（单帧重?+ retriggerable?            frame_waveform = self.generate_frame_waveform()
+            # 步骤5: 等待Counter任务自动完成（cfg_implicit_timing硬件自动停止?            # ====================================================================
+            # 步骤6: Counter已自动完?次计数，停止DO任务
+            # 注意：本次缓冲仅包含“单帧”，DO任务设置?retriggerable?            # 每次来自相机的上升沿触发都会重放这一?            logger.info(f"缓冲区已写入单帧: {frame_samples} 个采样点（retriggerable?)
+            # 等待Counter任务完成（硬件在?次上升沿后自动停止）
+            # 计算单帧预期时间（曝光时?+ 相机读取时间估计?            frame_expected_time = self.exposure_time_us / 1e6 + 0.05  # 曝光时间 + 50ms读取估计
+            # 计算当前帧在波形中的起始位置（setup之后?            frame_start = setup_samples + (frame_idx * frame_samples)
+            # 说明：本次仅写入“单帧”数据，DO 任务设置?retriggerable?            # 每个来自相机的上升沿都会重放该帧?            logger.info(f"缓冲区已写入单帧: {frame_samples} 个采样点（retriggerable?)
+            # 这里每次上升沿事件就是一?采样"
+            # 配置Counter输入通道来计数边?            counter_channel_path = f"{self.device_name}/{counter_channel}"  # 例如?Dev1/ctr0"
+            # 配置DO任务（注意：正确的属性名?samp_quant_samp_per_chan?            # ? generated/nidaqmx/task/_timing.py:1286
+            # 配置数字触发?            logger.info(f"配置数字边沿触发: {digital_trigger_source}")
+            # 配置隐式时钟 - 关键配置?            # ========================================================
+            # 默认仅激?88nm激光器
+            - Counter通道用于精确计数digital_trigger_source上的上升沿数?            - 例如?ctr0" 表示使用Counter 0通道
+            - NI USB-6423?个Counter：ctr0和ctr1
+            - 例如?/Dev1/PFI8" 表示设备Dev1的PFI8端口
+            - 此端口独立于数字输出端口（port0/line0-7），可同时使?            - 默认值：使用类常?DEFAULT_TRIGGER_SOURCE = "/Dev1/PFI8"
+            - 默认值：使用类常?DEFAULT_COUNTER_CHANNEL = "ctr0"
+            NI DAQ设备名称（例如："Dev1"?        exposure_time_us : float
+            True=高电平，False=低电?        duration_ms : float
+            ci_channel.ci_count_edges_term = digital_trigger_source  # 例如?/Dev1/PFI8"
+            log_interval = max(0.2, frame_expected_time / 2)  # 日志间隔为半帧时间，最?00ms
+            logger.debug(f"激?{laser_wavelength}nm 激光器 (line{line_num})")
+            logger.error(f"设置SLM enable时出? {e}")
+            logger.info(f"  - 模式: 隐式时钟（Implicit Timing? 有限采样（FINITE?)
+            logger.info(f"  - 硬件将在第{self.frames_per_loop}次上升沿后自动停止任?)
+            logger.info(f"  - 输入? {digital_trigger_source}")
+            logger.info(f"  使用Counter cfg_implicit_timing硬件自动停止（纳秒级精度?)
+            logger.info(f"  总耗时: {elapsed_total:.2f}?)
+            logger.info(f"总共精确执行?{self.num_loops * self.frames_per_loop} 次触?)
+            logger.info(f"硬件触发循环成功完成?)
+            logger.info(f"等待Counter硬件自动计数到{self.frames_per_loop}次触?..")
+            logger.info(f"设置SLM enable并等待响应时?{slm_setup_time_ms}ms")
+            print("?示例1失败\n")
+            print("?示例1完成\n")
+            print("?示例2失败\n")
+            print("?示例2完成\n")
+            print("?示例3失败（检查PFI8连接）\n")
+            print("?示例3完成?个循环，?5帧）\n")
+            raise ValueError("当前实现支持最?6条线的端口打包（USB-6423 P0?)
+            samps_per_chan=10000  # 将根据实际波形更?        )
+            信号持续时间（毫秒），默?0ms
+            形状?8, total_samples)的完整循环波?        """
+            形状?8, total_samples)的数字波形数?        """
+            每个采集循环的帧数（SIM默认??        num_loops : int
+            相机ready信号的输入端口（PFI端口?            - 这是NI DAQ的物理输入端口，用于接收相机的ready信号
+            硬件采样时钟频率（Hz）（默认?00 kHz = 10us分辨率）
+            示例?                [488] - 仅激?88nm（默认）
+            要激活的激光器波长列表（例如：[405, 488, 561, 647]?            如果为None，默认仅激?88nm激光器
+            要采集的完整循环?        sample_rate : float
+            间隔时间（毫秒），默?0ms
+           - DO任务输出一帧波形（相机触发、激光器、SLM信号?        4. 当Counter计数达到9次时，循环完?
+        """上下文管理器退?""
+        #         整个端口作为“单通道”使用，适配按端口位掩码进行写入?API?        # - 关键参数:
+        #   lines: 物理端口/线名称（?"Dev1/port0/line0:7"?        #   line_grouping: CHAN_FOR_ALL_LINES 表示整端口合并为一通道?        self.do_task.do_channels.add_do_chan(
+        # NI-DAQmx: 添加数字输出通道（DO?        # - 函数: add_do_chan(lines, name_to_assign_to_lines="", line_grouping=...)
+        # SLM Enable: 整个波形期间保持高电?        waveform[self.SLM_ENABLE_LINE, :] = 1
+        # SLM结束: 在相机和激光器trigger结束之后?00us脉冲?        finish_start = trigger_high_samples
+        # 为所有控制信号创建数字输出任?        self.do_task = nidaqmx.Task("DO_Control_Task")
+        # 为数字输出配置硬件定时采样时?        # NI-DAQmx: 配置采样时钟（rate/sample_mode/samps_per_chan?        self.do_task.timing.cfg_samp_clk_timing(
+        # 以采样点为单位计算时?        trigger_high_samples = self.exposure_samples
+        # 使用类常量作为默?        if digital_trigger_source is None:
+        # 使用默认参数即可，PFI8和ctr0已设置为默认?        success = controller.run_acquisition(
+        # 创建激光器波长到线路号的映?        self.laser_line_map = {
+        # 初始化波?(8个通道 x 采样?
+        # 初始化波形（全零?        waveform = np.zeros((8, total_samples), dtype=np.uint8)
+        # 对于大多数NI DAQ设备，数字输出电平由硬件跳线或设备配置决?        # 如果您的DAQ支持软件配置电压电平，请在此处添加配置代?        # 例如（如果支持）?        # self.do_task.do_channels.all.do_output_drive_type = ...
+        # 总采样点?= setup + 9?        total_samples = setup_samples + (frame_samples * self.frames_per_loop)
+        # 添加8个数字输出线?(line0-line7)
+        # 激光器触发: 曝光期间高电?[0, trigger_high_samples)
+        # 相机触发: 曝光期间高电?[0, trigger_high_samples)
+        # 警告: 请在NI MAX中确认您的DAQ设备数字I/O配置?.3V逻辑电平
+        # 计算SLM setup时间的采样点?        setup_samples = int((slm_setup_time_ms * 1000) / (1e6 / self.sample_rate))
+        # 计算单帧采样点数（曝?+ SLM结束脉冲?        trigger_edge_samples = max(1, int(100 / (1e6 / self.sample_rate)))  # 100us脉冲
+        # 设备规格速览（USB?423 关键参数与针脚）：见 docs/usb-6423-spec-notes.md
+        'active_lasers': None  # None = 默认?88nm
+        'num_loops': 5,  # 多循环测?        'sample_rate': 100000,  # 100kHz
+        - SLM trigger脉冲（帧开始时?00us?        - SLM finish脉冲（曝光结束后?00us?        - SLM enable信号（整帧期间高电平?
+        3. 每次相机ready信号到达?           - Counter计数+1
+        digital_trigger_source: str = None,  # 使用None，在函数内部使用类常?        counter_channel: str = None
+        exposure_time_us: float = 100000,  # 默认100ms?00,000us?        frames_per_loop: int = 9,
+        frame_samples = self.exposure_samples + trigger_edge_samples  # 正确的单帧采样点?
+        logger.info(f"  每循环帧? {frames_per_loop}")
+        logger.info(f"  触发? PFI端口（数字触发）")
+        logger.info(f"  采样? {sample_rate/1e3} kHz (分辨? {1e6/sample_rate:.1f} us)")
+        logger.info(f"SLM setup时间: {slm_setup_time_ms}ms，循环间? {interval_time_ms}ms")
+        logger.info(f"开始SIM采集（Counter精确计数模式? {self.num_loops} 个循?)
+        logger.info(f"每循?{self.frames_per_loop} ?)
+        logger.info(f"触发? {digital_trigger_source}, Counter: {counter_channel}")
+        logger.info(f"设置SLM enable = {'? if enable else '?}电平 ({duration_ms}ms)")
+        logger.warning("在NI MAX中检? DAQ设备 -> 右键 -> ?-> Device Pinouts -> Digital I/O")
+        logger.warning("请确认NI DAQ数字输出已配置为3.3V LVCMOS逻辑电平?)
+        print("使用Counter精确计数模式?个循环，?5帧）")
+        self.exposure_samples = int(exposure_time_us / (1e6 / sample_rate))  # 根据采样率计算采样点?        # ?00kHz时：1个采样点 = 10us?00ms = 10,000个采样点
+        trigger_edge_samples = max(1, int(100 / (1e6 / self.sample_rate)))  # 边沿触发信号?00us脉冲
+        为单帧采集生成数字波?
+        假设?i 行对应端口的?i 位（line0 -> bit0 ... line7 -> bit7?        """
+        初始化SIM控制?
+        单独设置SLM enable信号（高电平或低电平?
+        参数说明?        ----------
+        将形状为 (lines, samples) ?0/1 波形打包为端口位掩码数组（uint16，长度为 samples?
+        工作原理?        ----------
+        执行一个完整的采集循环?帧），使用Counter精确计数触发次数
+        执行完整的SIM采集序列（Counter精确计数模式?
+        执行循环间隔（将SLM enable设置为低电平?
+        此方法用于在循环开始前设置SLM enable，给SLM足够的响应时?
+        波形包括?        - 相机触发高电平（曝光期间?        - 选定激光器的同步触发高电平（曝光期间）
+        生成完整9帧循环波形，SLM enable在整个过程中保持高电?
+        配置NI DAQ的数字输出任?
+        重要: 配置?.3V LVCMOS逻辑电平以兼容ORCA-Fusion BT相机
+    # 激光器波长常量（用于用户友好的接口?    LASER_405 = 405
+    # 硬件配置常量（用户可修改?    DEFAULT_SAMPLE_RATE = 100000        # 100 kHz = 10微秒分辨?    DEFAULT_TRIGGER_SOURCE = "/Dev1/PFI8"  # 默认相机ready信号输入端口
+    # 示例1: 使用默认配置（仅488nm激光器?00ms曝光?    print("示例1: 默认配置 - 488nm激光器?00ms曝光，PFI8触发")
+    # 示例2: 双色成像，较短曝光时?    print("示例2: 双色成像 - 488nm?61nm激光器?0ms曝光")
+    # 示例3: 多循环采集测试（v6.0特色?    print("示例3: 多循环采?- 精确计数无timeout")
+    SIM成像硬件定时同步控制?
+    SIM控制器使用示?    """
+    print("    counter_channel='ctr0'                # 默认?)
+    print("    digital_trigger_source='/Dev1/PFI8',  # 默认?)
+    print("  - 使用cfg_implicit_timing，事件本身即是采样时?)
+    print("  - 必须使用数字触发信号（PFI端口?)
+    print("  - 每个循环保证精确9次触?)
+    print("  - 硬件Counter在第9次上升沿后自动完成任?)
+    print("  - 适合多循环采集，无时间误差累?)
+    print("?Counter通道: ctr0 (默认)")
+    print("?cfg_implicit_timing: 事件本身即是采样时钟")
+    print("?单帧时序: 曝光(100ms) + SLM结束脉冲(100us)")
+    print("?单循环时? 9?× ~100.1ms + 帧间等待 ?1?)
+    print("?无需Python轮询，不会提前结束或超时")
+    print("?相机ready信号: TTL数字信号(3.3V/5V)")
+    print("?硬件Counter在第9次上升沿后自动停?)
+    print("?纳秒级精度，完全由硬件实?)
+    print("?连接端口: PFI8 (默认)")
+    print("\n系统?")
+    print("核心?")
+    print("默认配置: 488nm激光器, 100ms曝光时间, 100kHz采样?)
+    该类管理结构光照明显微镜采集过程中相机、多波长激光器和SLM的精确时序和同步?    使用硬件Counter精确计数每个循环?次触发，确保采集精度?    """

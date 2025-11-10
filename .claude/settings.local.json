@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dir)",
+      "Bash(copy \"e:\\SIM-Brillouin\\code\\control\\nidaqmx-python-1.3.0\\sim_control_synchronized.py\" \"e:\\SIM-Brillouin\\code\\control\\SIM_Hardware_Control\\sim_control_synchronized.py\")",
+      "Bash(dir:*)",
+      "Read(//e/SIM-Brillouin/code/control/SIM_Hardware_Control/**)",
+      "Bash(findstr:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

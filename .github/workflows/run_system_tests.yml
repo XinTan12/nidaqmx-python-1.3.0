@@ -1,0 +1,60 @@
+name: Run system tests
+
+on:
+  workflow_call:
+  workflow_dispatch:
+jobs:
+  run_system_tests:
+    name: Run system tests
+    runs-on:
+      - self-hosted
+      - windows
+      - x64
+      - rdss-nidaqmxbot-${{ matrix.configuration }}
+    strategy:
+      matrix:
+        configuration: ["win-10-py32", "win-10-py64"]
+      # Fail-fast skews the pass/fail ratio and seems to make pytest produce
+      # incomplete JUnit XML results.
+      fail-fast: false
+    env:
+      # Work around https://github.com/ni/nidaqmx-python/issues/862 - docs tox
+      # env fails on rdss-nidaqmxbot-win-10-py32
+      tox-args: ${{ matrix.configuration == 'win-10-py32' && '--skip-env docs' || '' }}
+    timeout-minutes: 90
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+      - name: Import DAQmx config
+        run: C:\nidaqmxconfig\targets\win64U\x64\msvc-14.0\release\nidaqmxconfig.exe --eraseconfig --import tests\max_config\nidaqmxMaxConfig.ini
+      - name: Set up Python
+        uses: ni/python-actions/setup-python@9768589f3e50672173dad75a6fc181e4a85d33fa # v0.7.0
+      - name: Set up Poetry
+        uses: ni/python-actions/setup-poetry@9768589f3e50672173dad75a6fc181e4a85d33fa # v0.7.0
+      - name: Cache virtualenvs
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            .venv
+            .tox
+          key: run-system-tests-${{ runner.os }}-${{ matrix.configuration }}-${{ hashFiles('poetry.lock') }}
+      - name: Install dependencies
+        run: poetry install
+      - name: Run system tests
+        run: poetry run tox ${{ env.tox-args }}
+      - name: Rename test results
+        # TODO: Add Git Bash to the path on self-hosted Windows runners
+        run: Get-ChildItem test_results/*.xml | Rename-Item -NewName { $_.Name -replace '.xml','-${{ matrix.configuration }}.xml' }
+        if: always() && runner.os == 'Windows'
+      - name: Rename test results
+        run: |
+          for result in test_results/*.xml; do
+            mv $result ${result%.xml}-${{ matrix.configuration }}.xml
+          done
+        if: always() && runner.os != 'Windows'
+      - name: Upload test results
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: test_results_system_${{ matrix.configuration }}
+          path: test_results/*.xml
+        if: always()
